@@ -213,10 +213,10 @@ function agora() {
 }
 
 // ===================== SESSÕES PENDENTES =====================
-// Guarda boletos aguardando confirmação: { jid: { dados, empresaId, empresaNome } }
 const pendentes = new Map();
 let qrCodeAtual = null;
 let whatsappConectado = false;
+const eventLog = [];
 
 // ===================== PROCESSAR MENSAGEM =====================
 async function processarMensagem(sock, msg) {
@@ -367,27 +367,36 @@ async function conectarWhatsApp() {
         browser: ['Rufo Gestão', 'Chrome', '1.0.0'],
         connectTimeoutMs: 60000,
         keepAliveIntervalMs: 10000,
-        retryRequestDelayMs: 2000
+        retryRequestDelayMs: 2000,
+        syncFullHistory: false,
+        generateHighQualityLinkPreview: false
     });
 
     // QR Code via página web
     sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
+        const ts = new Date().toLocaleTimeString('pt-BR');
         if (qr) {
             qrCodeAtual = await QRCode.toDataURL(qr);
             whatsappConectado = false;
-            console.log('📱 QR Code gerado! Acesse a URL do serviço no Railway para escanear.');
+            eventLog.push(`[${ts}] 📱 QR Code gerado`);
+            console.log('📱 QR Code gerado! Acesse /qr para escanear.');
         }
         if (connection === 'open') {
             qrCodeAtual = null;
             whatsappConectado = true;
+            eventLog.push(`[${ts}] ✅ Conectado!`);
             console.log('✅ WhatsApp conectado com sucesso!');
         }
         if (connection === 'close') {
             whatsappConectado = false;
-            const deveReconectar = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-            console.log('🔄 Conexão encerrada. Reconectando:', deveReconectar);
+            const statusCode = lastDisconnect?.error?.output?.statusCode;
+            const errorMsg = lastDisconnect?.error?.message || 'sem mensagem';
+            eventLog.push(`[${ts}] 🔴 Desconectado. Code: ${statusCode} | ${errorMsg}`);
+            console.log(`🔴 Desconectado. StatusCode: ${statusCode} | Erro: ${errorMsg}`);
+            const deveReconectar = statusCode !== DisconnectReason.loggedOut;
             if (deveReconectar) setTimeout(conectarWhatsApp, 5000);
         }
+        if (eventLog.length > 30) eventLog.shift();
     });
 
     sock.ev.on('creds.update', saveCreds);
@@ -421,7 +430,21 @@ app.get('/', (req, res) => {
     });
 });
 
-app.get('/qr', (req, res) => {
+app.get('/status', (req, res) => {
+    res.send(`
+        <html>
+        <head><meta http-equiv="refresh" content="3"></head>
+        <body style="font-family:monospace;padding:30px;background:#111;color:#0f0;">
+            <h2 style="color:white;">🔍 Rufo Backend — Status</h2>
+            <p>WhatsApp: <strong>${whatsappConectado ? '✅ Conectado' : '⏳ Aguardando'}</strong></p>
+            <p>QR disponível: <strong>${qrCodeAtual ? 'Sim → <a href="/qr" style="color:cyan;">/qr</a>' : 'Não'}</strong></p>
+            <hr style="border-color:#333;">
+            <h3 style="color:white;">Últimos eventos:</h3>
+            ${eventLog.length ? eventLog.map(e => `<div>${e}</div>`).join('') : '<div>Nenhum evento ainda</div>'}
+            <p style="color:#555;font-size:11px;margin-top:20px;">Atualiza a cada 3s</p>
+        </body></html>
+    `);
+});
     if (whatsappConectado) {
         return res.send(`
             <html><body style="font-family:sans-serif;text-align:center;padding:50px;background:#1e3a5f;color:white;">
