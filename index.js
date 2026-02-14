@@ -9,7 +9,7 @@ const {
 import pino from 'pino';
 import express from 'express';
 import axios from 'axios';
-import qrcode from 'qrcode-terminal';
+import QRCode from 'qrcode';
 
 const app = express();
 app.use(express.json());
@@ -220,6 +220,8 @@ function agora() {
 // ===================== SESSÕES PENDENTES =====================
 // Guarda boletos aguardando confirmação: { jid: { dados, empresaId, empresaNome } }
 const pendentes = new Map();
+let qrCodeAtual = null;
+let whatsappConectado = false;
 
 // ===================== PROCESSAR MENSAGEM =====================
 async function processarMensagem(sock, msg) {
@@ -361,17 +363,20 @@ async function conectarWhatsApp() {
         browser: ['Rufo Gestão', 'Chrome', '1.0.0']
     });
 
-    // QR Code no terminal
+    // QR Code via página web
     sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
         if (qr) {
-            console.log('\n📱 ESCANEIE O QR CODE ABAIXO COM SEU WHATSAPP:\n');
-            qrcode.generate(qr, { small: true });
-            console.log('\n(WhatsApp → Dispositivos conectados → Conectar dispositivo)\n');
+            qrCodeAtual = await QRCode.toDataURL(qr);
+            whatsappConectado = false;
+            console.log('📱 QR Code gerado! Acesse a URL do serviço no Railway para escanear.');
         }
         if (connection === 'open') {
+            qrCodeAtual = null;
+            whatsappConectado = true;
             console.log('✅ WhatsApp conectado com sucesso!');
         }
         if (connection === 'close') {
+            whatsappConectado = false;
             const deveReconectar = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
             console.log('🔄 Conexão encerrada. Reconectando:', deveReconectar);
             if (deveReconectar) setTimeout(conectarWhatsApp, 5000);
@@ -403,8 +408,41 @@ app.get('/', (req, res) => {
     res.json({
         status: 'ok',
         service: 'Rufo Gestão Backend',
-        pendentes: pendentes.size
+        whatsapp: whatsappConectado ? 'conectado ✅' : 'aguardando QR ⏳',
+        pendentes: pendentes.size,
+        qr: whatsappConectado ? null : '/qr'
     });
+});
+
+app.get('/qr', (req, res) => {
+    if (whatsappConectado) {
+        return res.send(`
+            <html><body style="font-family:sans-serif;text-align:center;padding:50px;background:#1e3a5f;color:white;">
+                <h1>✅ WhatsApp já está conectado!</h1>
+                <p>Nenhuma ação necessária.</p>
+            </body></html>
+        `);
+    }
+    if (!qrCodeAtual) {
+        return res.send(`
+            <html>
+            <head><meta http-equiv="refresh" content="3"></head>
+            <body style="font-family:sans-serif;text-align:center;padding:50px;background:#1e3a5f;color:white;">
+                <h1>⏳ Aguardando QR Code...</h1>
+                <p>A página vai atualizar automaticamente em 3 segundos.</p>
+            </body></html>
+        `);
+    }
+    res.send(`
+        <html>
+        <head><meta http-equiv="refresh" content="30"></head>
+        <body style="font-family:sans-serif;text-align:center;padding:40px;background:#1e3a5f;color:white;">
+            <h1>📱 Rufo Gestão — Conectar WhatsApp</h1>
+            <p style="font-size:18px;">Abra o WhatsApp → <strong>Dispositivos conectados</strong> → <strong>Conectar dispositivo</strong></p>
+            <img src="${qrCodeAtual}" style="width:320px;height:320px;border:8px solid white;border-radius:16px;margin:20px auto;display:block;">
+            <p style="opacity:0.7;font-size:13px;">O QR expira em 60 segundos. A página atualiza automaticamente.</p>
+        </body></html>
+    `);
 });
 
 app.listen(PORT, () => {
