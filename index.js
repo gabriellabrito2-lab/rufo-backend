@@ -1,11 +1,6 @@
-import baileys from '@whiskeysockets/baileys';
-const {
-    default: makeWASocket,
-    useMultiFileAuthState,
-    DisconnectReason,
-    downloadMediaMessage,
-    fetchLatestBaileysVersion
-} = baileys;
+import pkg from '@whiskeysockets/baileys';
+const makeWASocket = pkg.default ?? pkg;
+const { useMultiFileAuthState, DisconnectReason, downloadMediaMessage, fetchLatestBaileysVersion } = pkg;
 import pino from 'pino';
 import express from 'express';
 import axios from 'axios';
@@ -353,14 +348,26 @@ async function processarMensagem(sock, msg) {
 // ===================== WHATSAPP CONNECTION =====================
 async function conectarWhatsApp() {
     const { state, saveCreds } = await useMultiFileAuthState('auth_info');
-    const { version } = await fetchLatestBaileysVersion();
+
+    let version = [2, 3000, 1015901307];
+    try {
+        const result = await fetchLatestBaileysVersion();
+        if (result?.version) version = result.version;
+    } catch (e) {
+        console.log('⚠️ Usando versão padrão do Baileys');
+    }
+
+    console.log('🔌 Iniciando conexão WhatsApp com versão:', version);
 
     const sock = makeWASocket({
         version,
         auth: state,
         logger: pino({ level: 'silent' }),
         printQRInTerminal: false,
-        browser: ['Rufo Gestão', 'Chrome', '1.0.0']
+        browser: ['Rufo Gestão', 'Chrome', '1.0.0'],
+        connectTimeoutMs: 60000,
+        keepAliveIntervalMs: 10000,
+        retryRequestDelayMs: 2000
     });
 
     // QR Code via página web
@@ -426,10 +433,11 @@ app.get('/qr', (req, res) => {
     if (!qrCodeAtual) {
         return res.send(`
             <html>
-            <head><meta http-equiv="refresh" content="3"></head>
+            <head><meta http-equiv="refresh" content="2"></head>
             <body style="font-family:sans-serif;text-align:center;padding:50px;background:#1e3a5f;color:white;">
                 <h1>⏳ Aguardando QR Code...</h1>
-                <p>A página vai atualizar automaticamente em 3 segundos.</p>
+                <p>A página vai atualizar automaticamente em 2 segundos.</p>
+                <p style="opacity:0.6;font-size:13px;">Se demorar mais de 30 segundos, reinicie o serviço no Railway.</p>
             </body></html>
         `);
     }
