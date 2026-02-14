@@ -1,25 +1,35 @@
-import pkg from '@whiskeysockets/baileys';
-const makeWASocket = pkg.default ?? pkg;
-const { useMultiFileAuthState, DisconnectReason, downloadMediaMessage, fetchLatestBaileysVersion } = pkg;
-import pino from 'pino';
-import express from 'express';
-import axios from 'axios';
-import QRCode from 'qrcode';
+const { Client, LocalAuth } = require('whatsapp-web.js');
+const express = require('express');
+const axios = require('axios');
+const QRCode = require('qrcode');
 
 const app = express();
 app.use(express.json());
 
-// ===================== CONFIG (variáveis de ambiente) =====================
-const GOOGLE_VISION_KEY  = process.env.GOOGLE_VISION_KEY;
-const FIREBASE_API_KEY   = process.env.FIREBASE_API_KEY;
-const FIREBASE_PROJECT   = process.env.FIREBASE_PROJECT_ID || 'rufo-gestao';
-const PORT               = process.env.PORT || 3000;
+// ===================== CONFIG =====================
+const GOOGLE_VISION_KEY = process.env.GOOGLE_VISION_KEY;
+const FIREBASE_API_KEY  = process.env.FIREBASE_API_KEY;
+const FIREBASE_PROJECT  = process.env.FIREBASE_PROJECT_ID || 'rufo-gestao';
+const PORT              = process.env.PORT || 3000;
 
-// ===================== FIRESTORE REST API =====================
+// ===================== STATE =====================
+let qrCodeAtual      = null;
+let whatsappConectado = false;
+const pendentes       = new Map();
+const eventLog        = [];
+
+function log(msg) {
+    const ts = new Date().toLocaleTimeString('pt-BR');
+    const linha = `[${ts}] ${msg}`;
+    console.log(linha);
+    eventLog.push(linha);
+    if (eventLog.length > 50) eventLog.shift();
+}
+
+// ===================== FIRESTORE REST =====================
 const FS_BASE = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT}/databases/(default)/documents`;
 const FS_KEY  = `?key=${FIREBASE_API_KEY}`;
 
-// Converte objeto JS → campos do Firestore
 function encodeFields(obj) {
     const fields = {};
     for (const [k, v] of Object.entries(obj)) {
@@ -31,7 +41,6 @@ function encodeFields(obj) {
     return fields;
 }
 
-// Converte campos do Firestore → objeto JS
 function decodeFields(fields) {
     if (!fields) return {};
     const obj = {};
@@ -45,271 +54,148 @@ function decodeFields(fields) {
     return obj;
 }
 
-// Busca documentos com filtro simples
 async function firestoreQuery(colecao, campo, valor) {
     try {
         const res = await axios.post(`${FS_BASE}:runQuery${FS_KEY}`, {
             structuredQuery: {
                 from: [{ collectionId: colecao }],
-                where: {
-                    fieldFilter: {
-                        field: { fieldPath: campo },
-                        op: 'EQUAL',
-                        value: { stringValue: valor }
-                    }
-                }
+                where: { fieldFilter: { field: { fieldPath: campo }, op: 'EQUAL', value: { stringValue: valor } } }
             }
         });
-        return res.data
-            .filter(r => r.document)
-            .map(r => ({
-                id: r.document.name.split('/').pop(),
-                ...decodeFields(r.document.fields)
-            }));
+        return res.data.filter(r => r.document).map(r => ({
+            id: r.document.name.split('/').pop(),
+            ...decodeFields(r.document.fields)
+        }));
     } catch (e) {
-        console.error('Firestore query error:', e.response?.data || e.message);
+        log('Firestore query error: ' + (e.response?.data?.error?.message || e.message));
         return [];
     }
 }
 
-// Adiciona documento novo
 async function firestoreAdd(colecao, dados) {
     try {
-        const res = await axios.post(`${FS_BASE}/${colecao}${FS_KEY}`, {
-            fields: encodeFields(dados)
-        });
+        const res = await axios.post(`${FS_BASE}/${colecao}${FS_KEY}`, { fields: encodeFields(dados) });
         return res.data.name.split('/').pop();
     } catch (e) {
-        console.error('Firestore add error:', e.response?.data || e.message);
+        log('Firestore add error: ' + (e.response?.data?.error?.message || e.message));
         return null;
     }
 }
 
-// ===================== OCR - GOOGLE VISION =====================
+// ===================== OCR =====================
 async function extrairDadosBoleto(imagemBase64) {
     try {
         const res = await axios.post(
             `https://vision.googleapis.com/v1/images:annotate?key=${GOOGLE_VISION_KEY}`,
-            {
-                requests: [{
-                    image: { content: imagemBase64 },
-                    features: [{ type: 'TEXT_DETECTION', maxResults: 1 }]
-                }]
-            }
+            { requests: [{ image: { content: imagemBase64 }, features: [{ type: 'TEXT_DETECTION', maxResults: 1 }] }] }
         );
-
         const texto = res.data.responses[0]?.fullTextAnnotation?.text || '';
-        console.log('--- OCR RAW TEXT ---\n', texto.slice(0, 500));
-
+        log('OCR extraiu ' + texto.length + ' caracteres');
         return parsearTextoBoleto(texto);
     } catch (e) {
-        console.error('Vision API error:', e.response?.data || e.message);
+        log('Vision API error: ' + (e.response?.data?.error?.message || e.message));
         return null;
     }
 }
 
-// Extrai valor, vencimento e descrição do texto bruto do OCR
 function parsearTextoBoleto(texto) {
-    const resultado = {
-        valor: null,
-        vencimento: null,
-        descricao: null,
-        textoCompleto: texto
-    };
+    const resultado = { valor: null, vencimento: null, descricao: null };
 
-    // ── VALOR ──────────────────────────────────────────────────
-    // Padrões: R$ 1.250,00 | Valor: 1250.00 | = 1.250,00
-    const regexValor = [
-        /R\$\s*([\d.,]+)/i,
-        /[Vv]alor[:\s]+R?\$?\s*([\d.,]+)/i,
-        /[Vv]alor\s+[Cc]obra[^\d]*([\d.,]+)/i,
-        /=\s*R?\$?\s*([\d.,]+)/,
-        /(?:TOTAL|Total)[:\s]+R?\$?\s*([\d.,]+)/i
-    ];
+    const regexValor = [/R\$\s*([\d.,]+)/i, /[Vv]alor[:\s]+R?\$?\s*([\d.,]+)/i, /(?:TOTAL|Total)[:\s]+R?\$?\s*([\d.,]+)/i];
     for (const r of regexValor) {
         const m = texto.match(r);
-        if (m) {
-            const raw = m[1].replace(/\./g, '').replace(',', '.');
-            const num = parseFloat(raw);
-            if (!isNaN(num) && num > 0) { resultado.valor = num; break; }
-        }
+        if (m) { const num = parseFloat(m[1].replace(/\./g, '').replace(',', '.')); if (!isNaN(num) && num > 0) { resultado.valor = num; break; } }
     }
 
-    // ── VENCIMENTO ─────────────────────────────────────────────
-    // Padrões: 20/02/2026 | 2026-02-20
-    const regexVenc = [
-        /[Vv]encimento[:\s]+(\d{2}\/\d{2}\/\d{4})/,
-        /[Vv]enc[:\.\s]+(\d{2}\/\d{2}\/\d{4})/,
-        /(\d{2}\/\d{2}\/\d{4})/
-    ];
+    const regexVenc = [/[Vv]encimento[:\s]+(\d{2}\/\d{2}\/\d{4})/, /(\d{2}\/\d{2}\/\d{4})/];
     for (const r of regexVenc) {
         const m = texto.match(r);
-        if (m) {
-            const [d, mo, a] = m[1].split('/');
-            resultado.vencimento = `${a}-${mo}-${d}`; // formato ISO para o Firebase
-            break;
-        }
+        if (m) { const [d, mo, a] = m[1].split('/'); resultado.vencimento = `${a}-${mo}-${d}`; break; }
     }
 
-    // ── DESCRIÇÃO ──────────────────────────────────────────────
-    // Tenta pegar Beneficiário ou Cedente ou Sacado
-    const regexDesc = [
-        /[Bb]enefici[áa]rio[:\s]+([^\n]+)/,
-        /[Cc]edente[:\s]+([^\n]+)/,
-        /[Pp]agador[:\s]+([^\n]+)/,
-        /[Ee]mpresa[:\s]+([^\n]+)/
-    ];
+    const regexDesc = [/[Bb]enefici[áa]rio[:\s]+([^\n]+)/, /[Cc]edente[:\s]+([^\n]+)/, /[Ee]mpresa[:\s]+([^\n]+)/];
     for (const r of regexDesc) {
         const m = texto.match(r);
-        if (m && m[1].trim().length > 2) {
-            resultado.descricao = m[1].trim().slice(0, 80);
-            break;
-        }
+        if (m && m[1].trim().length > 2) { resultado.descricao = m[1].trim().slice(0, 80); break; }
     }
-    // Se não achou, usa as primeiras palavras significativas
     if (!resultado.descricao) {
         const linhas = texto.split('\n').map(l => l.trim()).filter(l => l.length > 5);
         resultado.descricao = linhas[0]?.slice(0, 60) || 'Boleto via WhatsApp';
     }
-
     return resultado;
 }
 
-// ===================== NORMALIZAR TELEFONE =====================
-// WhatsApp envia como "5562997026547@s.whatsapp.net"
-// No Firebase pode estar salvo como "(62) 99702-6547", "62997026547", etc.
-function normalizarTelefone(jid) {
-    return jid.replace('@s.whatsapp.net', '').replace('@c.us', '').replace(/\D/g, '');
+// ===================== UTILS =====================
+function fmtDataBR(iso) { if (!iso) return '?'; const [a,m,d] = iso.split('-'); return `${d}/${m}/${a}`; }
+function fmtMoney(v)    { if (!v) return 'R$ ?'; return `R$ ${Number(v).toLocaleString('pt-BR',{minimumFractionDigits:2})}`; }
+function competencia()  { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`; }
+function agora()        { const d = new Date(); return `${d.toLocaleDateString('pt-BR')} às ${d.toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'})}`; }
+
+function telefoneBate(salvo, numero) {
+    const s = String(salvo||'').replace(/\D/g,'');
+    const n = String(numero||'').replace(/\D/g,'');
+    return s.endsWith(n.slice(-11)) || n.endsWith(s.slice(-11));
 }
 
-function telefoneBate(telefoneSalvo, numeroWpp) {
-    const s = String(telefoneSalvo || '').replace(/\D/g, '');
-    // Compara últimos 11 dígitos (sem o DDI 55)
-    const sufixo = numeroWpp.slice(-11);
-    return s.endsWith(sufixo) || s === numeroWpp;
-}
-
-// ===================== FORMATAR DATA BR =====================
-function fmtDataBR(isoDate) {
-    if (!isoDate) return 'não identificado';
-    const [a, m, d] = isoDate.split('-');
-    return `${d}/${m}/${a}`;
-}
-
-function fmtMoney(v) {
-    if (!v) return 'R$ ?';
-    return `R$ ${Number(v).toLocaleString('pt-BR', { minimumFractionDigits: 2 })}`;
-}
-
-// Competência atual no formato YYYY-MM
-function competenciaAtual() {
-    const d = new Date();
-    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
-}
-
-function agora() {
-    const d = new Date();
-    return `${d.toLocaleDateString('pt-BR')} às ${d.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })}`;
-}
-
-// ===================== SESSÕES PENDENTES =====================
-const pendentes = new Map();
-let qrCodeAtual = null;
-let whatsappConectado = false;
-const eventLog = [];
-
-// ===================== PROCESSAR MENSAGEM =====================
-async function processarMensagem(sock, msg) {
-    const jid    = msg.key.remoteJid;
-    const numero = normalizarTelefone(jid);
-
-    // ── Mensagem de texto (comandos) ──────────────────────────
-    if (msg.message?.conversation || msg.message?.extendedTextMessage) {
-        const texto = (msg.message.conversation || msg.message.extendedTextMessage?.text || '').trim().toUpperCase();
-
-        if (pendentes.has(jid)) {
-            const { dados, empresaId, empresaNome } = pendentes.get(jid);
-
-            if (texto === 'CONFIRMAR' || texto === 'S' || texto === 'SIM') {
-                // Lança no Firebase
-                const lancamento = {
-                    empresaId,
-                    tipo: 'pagar',
-                    competencia: dados.competencia || competenciaAtual(),
-                    descricao: dados.descricao,
-                    valor: dados.valor || 0,
-                    vencimento: dados.vencimento || new Date().toISOString().split('T')[0],
-                    status: 'aberto',
-                    origem: 'whatsapp',
-                    modificadoPor: `WhatsApp (${numero})`,
-                    modificadoEmail: jid,
-                    modificadoEm: agora(),
-                    createdAt: new Date().toISOString(),
-                    updatedAt: new Date().toISOString()
-                };
-                const docId = await firestoreAdd('lancamentos', lancamento);
-                pendentes.delete(jid);
-
-                if (docId) {
-                    await sock.sendMessage(jid, {
-                        text: `✅ *Lançado com sucesso!*\n\n🏢 Empresa: ${empresaNome}\n📝 Descrição: ${dados.descricao}\n💰 Valor: ${fmtMoney(dados.valor)}\n📅 Vencimento: ${fmtDataBR(dados.vencimento)}\n\nAcesse o painel para visualizar 👉 https://rufogestao.netlify.app`
-                    });
-                } else {
-                    await sock.sendMessage(jid, { text: '❌ Erro ao salvar no sistema. Tente novamente ou contate o administrador.' });
-                }
-
-            } else if (texto === 'CANCELAR' || texto === 'N' || texto === 'NAO' || texto === 'NÃO') {
-                pendentes.delete(jid);
-                await sock.sendMessage(jid, { text: '❌ Lançamento cancelado. Mande outra foto quando quiser.' });
-
-            } else {
-                await sock.sendMessage(jid, {
-                    text: `Por favor responda:\n\n✅ *CONFIRMAR* — para lançar o boleto\n❌ *CANCELAR* — para descartar`
-                });
-            }
-            return;
-        }
-
-        // Ajuda geral
-        await sock.sendMessage(jid, {
-            text: `👋 Olá! Sou o assistente da *Rufo Gestão*.\n\n📸 Me mande uma *foto de boleto* e eu faço o lançamento automático no sistema.\n\nDúvidas? Fale com seu consultor.`
-        });
-        return;
+// ===================== WHATSAPP CLIENT =====================
+const client = new Client({
+    authStrategy: new LocalAuth(),
+    puppeteer: {
+        args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-accelerated-2d-canvas',
+            '--no-first-run',
+            '--no-zygote',
+            '--single-process',
+            '--disable-gpu'
+        ],
+        headless: true
     }
+});
 
-    // ── Mensagem com imagem ───────────────────────────────────
-    const isImagem = msg.message?.imageMessage;
-    if (!isImagem) return;
+client.on('qr', async (qr) => {
+    log('📱 QR Code gerado! Acesse /qr para escanear.');
+    qrCodeAtual = await QRCode.toDataURL(qr);
+    whatsappConectado = false;
+});
 
-    await sock.sendMessage(jid, { text: '📸 Recebi a imagem! Processando o boleto... aguarde um instante.' });
+client.on('ready', () => {
+    log('✅ WhatsApp conectado com sucesso!');
+    qrCodeAtual = null;
+    whatsappConectado = true;
+});
 
-    try {
-        // Baixar a imagem
-        const buffer = await downloadMediaMessage(msg, 'buffer', {});
-        const base64  = buffer.toString('base64');
+client.on('disconnected', (reason) => {
+    log('🔴 WhatsApp desconectado: ' + reason);
+    whatsappConectado = false;
+    qrCodeAtual = null;
+    setTimeout(() => client.initialize(), 5000);
+});
 
-        // OCR
-        const dados = await extrairDadosBoleto(base64);
-        if (!dados) {
-            await sock.sendMessage(jid, { text: '❌ Não consegui ler a imagem. Tente tirar uma foto com mais luz e enquadramento completo do boleto.' });
-            return;
-        }
+client.on('message', async (msg) => {
+    if (msg.fromMe) return;
+    if (msg.from.endsWith('@g.us')) return; // ignora grupos
 
-        // Identificar empresa pelo número
-        const todasEmpresas = await firestoreQuery('empresas', 'telefone', numero);
-        let empresa = null;
+    const jid    = msg.from;
+    const numero = jid.replace('@c.us', '').replace(/\D/g, '');
 
-        if (todasEmpresas.length === 0) {
-            // Tenta variações do número
-            const numCurto = numero.slice(-11);
-            const empresas2 = await firestoreQuery('empresas', 'telefone', numCurto);
-            empresa = empresas2[0] || null;
-        } else {
-            empresa = todasEmpresas[0];
-        }
+    // ── Imagem ──────────────────────────────────
+    if (msg.hasMedia && msg.type === 'image') {
+        await msg.reply('📸 Recebi o boleto! Processando... aguarde.');
+        try {
+            const media = await msg.downloadMedia();
+            const base64 = media.data;
+            const dados = await extrairDadosBoleto(base64);
 
-        // Se não encontrou pelo número exato, busca todas e compara
-        if (!empresa) {
+            if (!dados) {
+                await msg.reply('❌ Não consegui ler a imagem. Tente uma foto com mais luz e o boleto completo.');
+                return;
+            }
+
+            // Buscar empresa pelo telefone
+            let empresa = null;
             try {
                 const allRes = await axios.get(`${FS_BASE}/empresas${FS_KEY}`);
                 const todas = (allRes.data.documents || []).map(d => ({
@@ -317,166 +203,119 @@ async function processarMensagem(sock, msg) {
                     ...decodeFields(d.fields)
                 }));
                 empresa = todas.find(e => telefoneBate(e.telefone, numero)) || null;
-            } catch {}
-        }
+            } catch (e) {
+                log('Erro ao buscar empresas: ' + e.message);
+            }
 
-        if (!empresa) {
-            // Salva o boleto como pendente mas pede qual empresa
-            pendentes.set(jid, { dados, empresaId: null, empresaNome: null, aguardandoEmpresa: true });
-            await sock.sendMessage(jid, {
-                text: `🔍 Não encontrei seu número cadastrado no sistema.\n\nDados lidos do boleto:\n📝 ${dados.descricao}\n💰 ${fmtMoney(dados.valor)}\n📅 Vencimento: ${fmtDataBR(dados.vencimento)}\n\nPor favor, responda com o *nome da empresa* para eu lançar corretamente.`
-            });
+            if (!empresa) {
+                pendentes.set(jid, { dados, aguardandoEmpresa: true });
+                await msg.reply(`🔍 Número não cadastrado no sistema.\n\nDados do boleto:\n📝 ${dados.descricao}\n💰 ${fmtMoney(dados.valor)}\n📅 Vencimento: ${fmtDataBR(dados.vencimento)}\n\nResponda com o *nome da empresa* para lançar.`);
+                return;
+            }
+
+            pendentes.set(jid, { dados, empresaId: empresa.id, empresaNome: empresa.razaoSocial });
+            const aviso = (!dados.valor || !dados.vencimento) ? '\n\n⚠️ _Alguns dados não identificados. Confira no painel após confirmar._' : '';
+            await msg.reply(`📋 *Boleto identificado!*\n\n🏢 *${empresa.razaoSocial}*\n📝 ${dados.descricao}\n💰 *${fmtMoney(dados.valor)}*\n📅 *${fmtDataBR(dados.vencimento)}*${aviso}\n\nResponda:\n✅ *CONFIRMAR* — lançar em Contas a Pagar\n❌ *CANCELAR* — descartar`);
+        } catch (err) {
+            log('Erro ao processar imagem: ' + err.message);
+            await msg.reply('❌ Erro ao processar. Tente novamente.');
+        }
+        return;
+    }
+
+    // ── Texto ────────────────────────────────────
+    const texto = (msg.body || '').trim().toUpperCase();
+
+    if (pendentes.has(jid)) {
+        const p = pendentes.get(jid);
+
+        if (p.aguardandoEmpresa) {
+            const empresas = await firestoreQuery('empresas', 'razaoSocial', msg.body.trim());
+            if (!empresas.length) {
+                await msg.reply('❌ Empresa não encontrada. Verifique o nome e tente novamente.');
+                return;
+            }
+            const empresa = empresas[0];
+            pendentes.set(jid, { dados: p.dados, empresaId: empresa.id, empresaNome: empresa.razaoSocial });
+            await msg.reply(`✅ Empresa encontrada: *${empresa.razaoSocial}*\n\nConfirmar lançamento?\n\n✅ *CONFIRMAR* ou ❌ *CANCELAR*`);
             return;
         }
 
-        // Empresa encontrada — pede confirmação
-        pendentes.set(jid, { dados, empresaId: empresa.id, empresaNome: empresa.razaoSocial });
-
-        const temDuvida = !dados.valor || !dados.vencimento;
-        const aviso = temDuvida ? '\n\n⚠️ _Alguns dados não foram identificados claramente. Confira no painel após confirmar._' : '';
-
-        await sock.sendMessage(jid, {
-            text: `📋 *Boleto identificado!*\n\n🏢 Empresa: *${empresa.razaoSocial}*\n📝 Descrição: ${dados.descricao}\n💰 Valor: *${fmtMoney(dados.valor)}*\n📅 Vencimento: *${fmtDataBR(dados.vencimento)}*${aviso}\n\nResponda:\n✅ *CONFIRMAR* — para lançar em Contas a Pagar\n❌ *CANCELAR* — para descartar`
-        });
-
-    } catch (err) {
-        console.error('Erro ao processar imagem:', err);
-        await sock.sendMessage(jid, { text: '❌ Ocorreu um erro ao processar. Tente novamente ou contate o suporte.' });
-    }
-}
-
-// ===================== WHATSAPP CONNECTION =====================
-async function conectarWhatsApp() {
-    const { state, saveCreds } = await useMultiFileAuthState('auth_info');
-
-    let version = [2, 3000, 1015901307];
-    try {
-        const result = await fetchLatestBaileysVersion();
-        if (result?.version) version = result.version;
-    } catch (e) {
-        console.log('⚠️ Usando versão padrão do Baileys');
-    }
-
-    console.log('🔌 Iniciando conexão WhatsApp com versão:', version);
-
-    const sock = makeWASocket({
-        version,
-        auth: state,
-        logger: pino({ level: 'silent' }),
-        printQRInTerminal: false,
-        browser: ['Rufo Gestão', 'Chrome', '1.0.0'],
-        connectTimeoutMs: 60000,
-        keepAliveIntervalMs: 10000,
-        retryRequestDelayMs: 2000,
-        syncFullHistory: false,
-        generateHighQualityLinkPreview: false
-    });
-
-    // QR Code via página web
-    sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
-        const ts = new Date().toLocaleTimeString('pt-BR');
-        if (qr) {
-            qrCodeAtual = await QRCode.toDataURL(qr);
-            whatsappConectado = false;
-            eventLog.push(`[${ts}] 📱 QR Code gerado`);
-            console.log('📱 QR Code gerado! Acesse /qr para escanear.');
-        }
-        if (connection === 'open') {
-            qrCodeAtual = null;
-            whatsappConectado = true;
-            eventLog.push(`[${ts}] ✅ Conectado!`);
-            console.log('✅ WhatsApp conectado com sucesso!');
-        }
-        if (connection === 'close') {
-            whatsappConectado = false;
-            const statusCode = lastDisconnect?.error?.output?.statusCode;
-            const errorMsg = lastDisconnect?.error?.message || 'sem mensagem';
-            eventLog.push(`[${ts}] 🔴 Desconectado. Code: ${statusCode} | ${errorMsg}`);
-            console.log(`🔴 Desconectado. StatusCode: ${statusCode} | Erro: ${errorMsg}`);
-            const deveReconectar = statusCode !== DisconnectReason.loggedOut;
-            if (deveReconectar) setTimeout(conectarWhatsApp, 5000);
-        }
-        if (eventLog.length > 30) eventLog.shift();
-    });
-
-    sock.ev.on('creds.update', saveCreds);
-
-    // Mensagens recebidas
-    sock.ev.on('messages.upsert', async ({ messages, type }) => {
-        if (type !== 'notify') return;
-        for (const msg of messages) {
-            if (msg.key.fromMe) continue;           // ignora mensagens enviadas por mim
-            if (!msg.message) continue;              // ignora mensagens vazias
-            if (msg.key.remoteJid.endsWith('@g.us')) continue; // ignora grupos
-            try {
-                await processarMensagem(sock, msg);
-            } catch (err) {
-                console.error('Erro ao processar msg:', err);
+        if (texto === 'CONFIRMAR' || texto === 'S' || texto === 'SIM') {
+            const lancamento = {
+                empresaId: p.empresaId,
+                tipo: 'pagar',
+                competencia: competencia(),
+                descricao: p.dados.descricao,
+                valor: p.dados.valor || 0,
+                vencimento: p.dados.vencimento || new Date().toISOString().split('T')[0],
+                status: 'aberto',
+                origem: 'whatsapp',
+                modificadoPor: `WhatsApp (${numero})`,
+                modificadoEmail: jid,
+                modificadoEm: agora(),
+                createdAt: new Date().toISOString(),
+                updatedAt: new Date().toISOString()
+            };
+            const docId = await firestoreAdd('lancamentos', lancamento);
+            pendentes.delete(jid);
+            if (docId) {
+                await msg.reply(`✅ *Lançado com sucesso!*\n\n🏢 ${p.empresaNome}\n📝 ${p.dados.descricao}\n💰 ${fmtMoney(p.dados.valor)}\n📅 ${fmtDataBR(p.dados.vencimento)}\n\nAcesse o painel 👉 https://rufogestao.netlify.app`);
+            } else {
+                await msg.reply('❌ Erro ao salvar. Tente novamente ou contate o administrador.');
             }
+        } else if (texto === 'CANCELAR' || texto === 'N' || texto === 'NAO' || texto === 'NÃO') {
+            pendentes.delete(jid);
+            await msg.reply('❌ Lançamento cancelado.');
+        } else {
+            await msg.reply('Responda *CONFIRMAR* para lançar ou *CANCELAR* para descartar.');
         }
-    });
+        return;
+    }
 
-    return sock;
-}
+    await msg.reply('👋 Olá! Sou o assistente da *Rufo Gestão*.\n\n📸 Me mande uma *foto de boleto* e faço o lançamento automático no sistema.');
+});
 
-// ===================== EXPRESS SERVER =====================
+// ===================== EXPRESS =====================
 app.get('/', (req, res) => {
-    res.json({
-        status: 'ok',
-        service: 'Rufo Gestão Backend',
-        whatsapp: whatsappConectado ? 'conectado ✅' : 'aguardando QR ⏳',
-        pendentes: pendentes.size,
-        qr: whatsappConectado ? null : '/qr'
-    });
+    res.json({ status: 'ok', service: 'Rufo Gestão Backend', whatsapp: whatsappConectado ? 'conectado ✅' : 'aguardando QR ⏳', qr: whatsappConectado ? null : '/qr' });
+});
+
+app.get('/qr', (req, res) => {
+    if (whatsappConectado) {
+        return res.send(`<html><body style="font-family:sans-serif;text-align:center;padding:50px;background:#1e3a5f;color:white;"><h1>✅ WhatsApp conectado!</h1></body></html>`);
+    }
+    if (!qrCodeAtual) {
+        return res.send(`<html><head><meta http-equiv="refresh" content="3"></head><body style="font-family:sans-serif;text-align:center;padding:50px;background:#1e3a5f;color:white;"><h1>⏳ Gerando QR Code...</h1><p>Página atualiza em 3 segundos.</p></body></html>`);
+    }
+    res.send(`
+        <html><head><meta http-equiv="refresh" content="30"></head>
+        <body style="font-family:sans-serif;text-align:center;padding:40px;background:#1e3a5f;color:white;">
+            <h1>📱 Conectar WhatsApp — Rufo Gestão</h1>
+            <p style="font-size:18px;">WhatsApp → <strong>Dispositivos conectados</strong> → <strong>Conectar dispositivo</strong></p>
+            <img src="${qrCodeAtual}" style="width:320px;height:320px;border:8px solid white;border-radius:16px;margin:20px auto;display:block;">
+            <p style="opacity:0.7;font-size:13px;">QR expira em 60s. Página atualiza automaticamente.</p>
+        </body></html>
+    `);
 });
 
 app.get('/status', (req, res) => {
     res.send(`
-        <html>
-        <head><meta http-equiv="refresh" content="3"></head>
+        <html><head><meta http-equiv="refresh" content="3"></head>
         <body style="font-family:monospace;padding:30px;background:#111;color:#0f0;">
             <h2 style="color:white;">🔍 Rufo Backend — Status</h2>
             <p>WhatsApp: <strong>${whatsappConectado ? '✅ Conectado' : '⏳ Aguardando'}</strong></p>
-            <p>QR disponível: <strong>${qrCodeAtual ? 'Sim → <a href="/qr" style="color:cyan;">/qr</a>' : 'Não'}</strong></p>
+            <p>QR: <strong>${qrCodeAtual ? '<a href="/qr" style="color:cyan;">Disponível → /qr</a>' : 'Não gerado ainda'}</strong></p>
             <hr style="border-color:#333;">
-            <h3 style="color:white;">Últimos eventos:</h3>
-            ${eventLog.length ? eventLog.map(e => `<div>${e}</div>`).join('') : '<div>Nenhum evento ainda</div>'}
-            <p style="color:#555;font-size:11px;margin-top:20px;">Atualiza a cada 3s</p>
-        </body></html>
-    `);
-});
-    if (whatsappConectado) {
-        return res.send(`
-            <html><body style="font-family:sans-serif;text-align:center;padding:50px;background:#1e3a5f;color:white;">
-                <h1>✅ WhatsApp já está conectado!</h1>
-                <p>Nenhuma ação necessária.</p>
-            </body></html>
-        `);
-    }
-    if (!qrCodeAtual) {
-        return res.send(`
-            <html>
-            <head><meta http-equiv="refresh" content="2"></head>
-            <body style="font-family:sans-serif;text-align:center;padding:50px;background:#1e3a5f;color:white;">
-                <h1>⏳ Aguardando QR Code...</h1>
-                <p>A página vai atualizar automaticamente em 2 segundos.</p>
-                <p style="opacity:0.6;font-size:13px;">Se demorar mais de 30 segundos, reinicie o serviço no Railway.</p>
-            </body></html>
-        `);
-    }
-    res.send(`
-        <html>
-        <head><meta http-equiv="refresh" content="30"></head>
-        <body style="font-family:sans-serif;text-align:center;padding:40px;background:#1e3a5f;color:white;">
-            <h1>📱 Rufo Gestão — Conectar WhatsApp</h1>
-            <p style="font-size:18px;">Abra o WhatsApp → <strong>Dispositivos conectados</strong> → <strong>Conectar dispositivo</strong></p>
-            <img src="${qrCodeAtual}" style="width:320px;height:320px;border:8px solid white;border-radius:16px;margin:20px auto;display:block;">
-            <p style="opacity:0.7;font-size:13px;">O QR expira em 60 segundos. A página atualiza automaticamente.</p>
+            <h3 style="color:white;">Log:</h3>
+            ${eventLog.length ? [...eventLog].reverse().map(e => `<div>${e}</div>`).join('') : '<div>Nenhum evento</div>'}
         </body></html>
     `);
 });
 
+// ===================== START =====================
 app.listen(PORT, () => {
-    console.log(`🚀 Servidor rodando na porta ${PORT}`);
-    conectarWhatsApp();
+    log(`🚀 Servidor na porta ${PORT}`);
+    log('🔌 Iniciando WhatsApp...');
+    client.initialize();
 });
