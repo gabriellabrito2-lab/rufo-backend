@@ -236,6 +236,8 @@
         <div class="tabs">
             <button class="tab-btn active" data-tab="tabEmpresas">🏢 Empresas</button>
             <button class="tab-btn" data-tab="tabAdmins">👨‍💼 Administradores</button>
+            <button class="tab-btn" data-tab="tabCategorias">📊 Categorias DRE</button>
+            <button class="tab-btn" data-tab="tabUploadAdmin">📸 Upload de Boletos</button>
         </div>
 
         <!-- EMPRESAS -->
@@ -266,6 +268,65 @@
                         <thead><tr><th>Nome</th><th>E-mail</th><th>Ações</th></tr></thead>
                         <tbody id="tbAdmins"></tbody>
                     </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- CATEGORIAS DRE -->
+        <div id="tabCategorias" class="tab-content">
+            <div class="section-card">
+                <div class="section-header">
+                    <h2 class="section-title">Categorias do DRE</h2>
+                    <button class="btn btn-add" onclick="window.abrirModalCategoria()">+ Nova Categoria</button>
+                </div>
+                <p style="color:var(--text-light);margin-bottom:20px;">Gerencie as categorias que aparecem no DRE. Cada lançamento deve ter uma categoria.</p>
+                <div class="table-wrapper">
+                    <table>
+                        <thead><tr><th>Nome</th><th>Tipo</th><th>Ações</th></tr></thead>
+                        <tbody id="tbCategorias"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- UPLOAD DE BOLETOS ADMIN -->
+        <div id="tabUploadAdmin" class="tab-content">
+            <div class="section-card">
+                <h2 class="section-title">📸 Upload de Boletos e Planilhas</h2>
+                <div class="alert alert-info" style="margin-bottom:20px;">
+                    ℹ️ <strong>Para Admin:</strong> Selecione a empresa antes de fazer upload.<br>
+                    📸 <strong>Boletos:</strong> Upload da imagem + preenchimento manual dos dados<br>
+                    📊 <strong>Planilhas:</strong> Lançamento em massa automático
+                </div>
+                
+                <div class="form-group" style="max-width:400px;margin-bottom:25px;">
+                    <label>Selecionar Empresa *</label>
+                    <select id="adminUploadEmpresa" style="padding:12px;border:2px solid var(--border);border-radius:10px;font-size:15px;width:100%;">
+                        <option value="">-- Selecione uma empresa --</option>
+                    </select>
+                </div>
+
+                <div id="uploadDropZoneAdmin" style="border:3px dashed var(--border);border-radius:15px;padding:60px 20px;text-align:center;background:var(--light);cursor:pointer;transition:all 0.3s;opacity:0.5;" onclick="iniciarUploadAdmin()">
+                    <div style="font-size:48px;margin-bottom:15px;">📤</div>
+                    <p style="font-size:18px;font-weight:600;color:var(--primary);margin-bottom:8px;">Clique ou arraste arquivos aqui</p>
+                    <p style="font-size:13px;color:var(--text-light);">Imagens (JPG/PNG/PDF) ou Planilhas (XLSX/CSV)</p>
+                    <input type="file" id="uploadInputAdmin" accept=".jpg,.jpeg,.png,.pdf,.xlsx,.xls,.csv" multiple style="display:none;" onchange="processarArquivosAdmin(this.files)">
+                </div>
+
+                <div id="uploadPreviewAdmin" style="margin-top:25px;display:none;">
+                    <div class="section-header">
+                        <h3 class="section-title">📋 Pré-visualização</h3>
+                        <div style="display:flex;gap:10px;">
+                            <button class="btn btn-secondary" onclick="confirmarUploadAdmin()">✅ Confirmar e Lançar</button>
+                            <button class="btn btn-light" onclick="cancelarUploadAdmin()">❌ Cancelar</button>
+                        </div>
+                    </div>
+                    <div id="uploadListAdmin"></div>
+                </div>
+
+                <div id="uploadProcessingAdmin" style="display:none;text-align:center;padding:40px;">
+                    <div class="loading-spinner" style="width:40px;height:40px;margin:0 auto 20px;"></div>
+                    <p style="font-size:16px;color:var(--text-light);">Processando arquivos...</p>
                 </div>
             </div>
         </div>
@@ -406,7 +467,10 @@
         <div id="tabUpload" class="tab-content">
             <div class="section-card">
                 <h2 class="section-title">📸 Upload de Boletos e Planilhas</h2>
-                <p style="color:var(--text-light);margin-bottom:20px;">Arraste arquivos ou clique para selecionar. Suporte: JPG, PNG, PDF (boletos) e XLSX, CSV (planilhas)</p>
+                <p style="color:var(--text-light);margin-bottom:20px;">
+                    <strong>📸 Boletos (JPG/PNG/PDF):</strong> Faça upload da imagem e preencha os dados manualmente enquanto visualiza o boleto.<br>
+                    <strong>📊 Planilhas (XLSX/CSV):</strong> Lançamento em massa - o sistema lê automaticamente todas as linhas.
+                </p>
                 
                 <div id="uploadDropZone" style="border:3px dashed var(--border);border-radius:15px;padding:60px 20px;text-align:center;background:var(--light);cursor:pointer;transition:all 0.3s;" onclick="document.getElementById('uploadInput').click()">
                     <div style="font-size:48px;margin-bottom:15px;">📤</div>
@@ -499,6 +563,11 @@
             <input type="hidden" id="lancTipo">
             <div class="form-group"><label>Mês de Competência *</label><input type="month" id="lCompetencia" required></div>
             <div class="form-group"><label>Descrição *</label><input type="text" id="lDescricao" required></div>
+            <div class="form-group"><label>Categoria DRE *</label>
+                <select id="lCategoria" required>
+                    <option value="">-- Selecione --</option>
+                </select>
+            </div>
             <div class="form-group"><label>Valor (R$) *</label><input type="number" step="0.01" id="lValor" required></div>
             <div class="form-group"><label>Vencimento *</label><input type="date" id="lVencimento" required></div>
             <div class="form-group"><label>Status</label>
@@ -525,6 +594,28 @@
             <button class="btn-cancel" onclick="fecharModal('modalConfirm')">Cancelar</button>
             <button class="btn-submit" id="confirmBtn" style="background:var(--danger);">Excluir</button>
         </div>
+    </div>
+</div>
+
+<!-- MODAL CATEGORIA -->
+<div id="modalCategoria" class="modal">
+    <div class="modal-box">
+        <h2 id="modalCategoriaTitulo">Nova Categoria DRE</h2>
+        <form id="formCategoria">
+            <input type="hidden" id="catEditId">
+            <div class="form-group"><label>Nome da Categoria *</label><input type="text" id="catNome" required placeholder="Ex: Despesas com Marketing"></div>
+            <div class="form-group"><label>Tipo *</label>
+                <select id="catTipo" required>
+                    <option value="">-- Selecione --</option>
+                    <option value="receita">Receita</option>
+                    <option value="despesa">Despesa</option>
+                </select>
+            </div>
+            <div class="modal-actions">
+                <button type="button" class="btn-cancel" onclick="fecharModal('modalCategoria')">Cancelar</button>
+                <button type="submit" class="btn-submit">Salvar</button>
+            </div>
+        </form>
     </div>
 </div>
 
